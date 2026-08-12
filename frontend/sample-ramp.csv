@@ -1,0 +1,7 @@
+Type,Transaction Date,Amount,Merchant Description,Ramp Location,Accounting Category Code,External ID
+Transaction,6/11/2026,94.08,LINDE GAS & EQUIPMENT INC,Rio Springs,5445,ext-001
+Transaction,6/12/2026,4,FACEBK *CARWMUVTH2,Rio Springs,5615,ext-002
+Payment,6/12/2026,1000,Payment,Rio Springs,,ext-pay
+Transaction,6/13/2026,74.49,PIZZA HUT 039240,Rio Springs,,ext-003
+Transfer,6/14/2026,50,Transfer,Rio Springs,1000,ext-xfer
+Transaction,6/15/2026,59.92,THE HOME DEPOT #6529,Rio Springs,5436,ext-004

@@ -1,0 +1,447 @@
+import fs from "fs";
+import path from "path";
+
+import { getField, parseCsv, toCsv } from "./csv.js";
+
+export const IMPORT_HEADERS = [
+  "Property Abbreviation",
+  "Date",
+  "GL Account Number",
+  "Description",
+  "Debit",
+  "Credit",
+  "Accounting Basis",
+  "Line-Item Description",
+  "Reversal Date",
+  "Reference",
+] as const;
+
+export const FLAGGED_HEADERS = [
+  "Date",
+  "Amount",
+  "Merchant Description",
+  "Ramp Location",
+  "External ID",
+  "Issue",
+] as const;
+
+export type ImportRow = Record<(typeof IMPORT_HEADERS)[number], string>;
+export type FlaggedRow = Record<(typeof FLAGGED_HEADERS)[number], string>;
+
+export type ProcessSummary = {
+  transactionCount: number;
+  importLineCount: number;
+  flaggedCount: number;
+  totalDebit: number;
+  totalCredit: number;
+  balanced: boolean;
+  propertyCode: string;
+  periodYYYYMM: string;
+  importFileName: string;
+  skippedNonTransactionCount: number;
+  properties: string[];
+};
+
+export type ProcessResult = {
+  importCsv: string;
+  importRows: ImportRow[];
+  flaggedRows: FlaggedRow[];
+  summary: ProcessSummary;
+};
+
+type LocationConfig = { ccGl: string; fileCode?: string };
+type PriorCharge = {
+  merchant: string;
+  card: string;
+  amount: number;
+  remaining: number;
+  gl: string;
+  memo: string;
+  category: string;
+};
+
+function loadLocationConfig(): Record<string, LocationConfig> {
+  const here = path.resolve(process.cwd());
+  const candidates = [
+    path.join(here, "cc-payable-gl.json"),
+    path.join(here, "..", "cc-payable-gl.json"),
+    path.join(here, "backend", "cc-payable-gl.json"),
+  ];
+
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<
+      string,
+      string | LocationConfig
+    >;
+    const out: Record<string, LocationConfig> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      const key = normalizeLocationKey(k);
+      if (typeof v === "string") {
+        out[key] = { ccGl: v.trim() };
+      } else {
+        out[key] = {
+          ccGl: String(v.ccGl ?? "").trim(),
+          fileCode: v.fileCode?.trim(),
+        };
+      }
+    }
+    return out;
+  }
+  return {};
+}
+
+function normalizeLocationKey(location: string): string {
+  return location.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Initials from Ramp Location words (letters only): "Rio Springs" → "RS". */
+export function derivePropertyAbbreviation(location: string): string {
+  const words = location
+    .trim()
+    .split(/[\s/_-]+/)
+    .map((w) => w.replace(/[^A-Za-z]/g, ""))
+    .filter(Boolean);
+
+  if (words.length === 0) return "";
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return words.map((w) => w[0].toUpperCase()).join("");
+}
+
+function resolveLocationConfig(location: string): LocationConfig | null {
+  const map = loadLocationConfig();
+  const key = normalizeLocationKey(location);
+  if (map[key]) return map[key];
+  for (const [name, cfg] of Object.entries(map)) {
+    if (key === name || key.startsWith(`${name} `) || key.includes(name)) {
+      return cfg;
+    }
+  }
+  return null;
+}
+
+/**
+ * Infer expense GL when Accounting Category Code is blank — from prior coded
+ * charges for the same merchant (and card when possible). Matches how Claude
+ * filled refunds like Home Depot −1277.75 → 1370 from the canceled charge.
+ */
+function inferExpenseGl(
+  merchant: string,
+  card: string,
+  signedAmount: number,
+  priors: PriorCharge[],
+): string | null {
+  const absAmt = Math.abs(signedAmount);
+  const isRefund = signedAmount < 0;
+  const sameMerchant = [...priors]
+    .reverse()
+    .filter((p) => p.merchant === merchant);
+  const sameCard = sameMerchant.filter((p) => card && p.card === card);
+  const pool = sameCard.length > 0 ? sameCard : sameMerchant;
+
+  if (isRefund && pool.length > 0) {
+    const canceled = pool.find(
+      (p) => /cancel/i.test(p.memo) && p.remaining + 0.001 >= absAmt,
+    );
+    if (canceled) {
+      canceled.remaining = round2(canceled.remaining - absAmt);
+      return canceled.gl;
+    }
+
+    const exactRemaining = pool.find(
+      (p) => Math.abs(p.remaining - absAmt) < 0.015,
+    );
+    if (exactRemaining) {
+      exactRemaining.remaining = 0;
+      return exactRemaining.gl;
+    }
+
+    return pool[0].gl;
+  }
+
+  // Blank charge that looks HVAC/AC-related → reuse prior HVAC GL (e.g. Daikin 5445)
+  if (!isRefund && /(?:\bAC\b|A\/C|HVAC|FREON)/i.test(merchant)) {
+    const hvac = [...priors]
+      .reverse()
+      .find(
+        (p) =>
+          /hvac/i.test(p.category) || /DAIKIN|LINDE/i.test(p.merchant),
+      );
+    if (hvac) {
+      return hvac.gl;
+    }
+  }
+
+  if (sameMerchant.length > 0) return sameMerchant[0].gl;
+
+  const token = merchant.split(/\s+/)[0]?.replace(/[^A-Za-z]/g, "") ?? "";
+  if (token.length >= 4) {
+    const family = [...priors]
+      .reverse()
+      .find((p) =>
+        p.merchant.toUpperCase().startsWith(token.toUpperCase()),
+      );
+    if (family) return family.gl;
+  }
+
+  return null;
+}
+
+export function processRampStatement(csvText: string): ProcessResult {
+  const { headers, rows } = parseCsv(csvText);
+
+  if (headers.length === 0) {
+    throw new Error("CSV is empty");
+  }
+
+  const required = ["Type", "Amount", "Merchant Description", "Ramp Location"];
+  const lower = headers.map((h) => h.trim().toLowerCase());
+  const missing = required.filter((r) => !lower.includes(r.toLowerCase()));
+  if (missing.length > 0) {
+    throw new Error(
+      `Not a Ramp statement CSV. Missing columns: ${missing.join(", ")}. Upload the Ramp export (with Type, Transaction Date, etc.), not the ResMan import sheet.`,
+    );
+  }
+
+  const hasTransactionDate = lower.includes("transaction date");
+  const hasClearingDate = lower.includes("clearing date");
+  if (!hasTransactionDate && !hasClearingDate) {
+    throw new Error("Ramp CSV must include Transaction Date or Clearing Date");
+  }
+
+  const importRows: ImportRow[] = [];
+  const flaggedRows: FlaggedRow[] = [];
+  let skippedNonTransactionCount = 0;
+  const propertyCodes = new Set<string>();
+  const fileCodes = new Set<string>();
+  const dates: Date[] = [];
+  const priors: PriorCharge[] = [];
+  let headerMemo = "";
+
+  for (const row of rows) {
+    const type = getField(row, "Type");
+    const dateRaw = hasTransactionDate
+      ? getField(row, "Transaction Date", "Date") ||
+        getField(row, "Clearing Date")
+      : getField(row, "Clearing Date");
+    const amountRaw = getField(row, "Amount");
+    const merchant = getField(row, "Merchant Description", "Merchant Name");
+    const location = getField(row, "Ramp Location", "Location");
+    let glCode = getField(row, "Accounting Category Code");
+    const externalId = getField(row, "External ID", "Transaction ID", "Id");
+    const card = getField(row, "Card Last 4");
+    const memo = getField(row, "Memo");
+    const category = getField(row, "Accounting Category");
+    if (!headerMemo) headerMemo = getField(row, "Header Memo");
+
+    if (type.toLowerCase() !== "transaction") {
+      skippedNonTransactionCount++;
+      continue;
+    }
+
+    const parsedDate = parseFlexibleDate(dateRaw);
+    const outputDate = formatOutputDate(parsedDate) || dateRaw;
+    const signed = parseSignedAmount(amountRaw);
+
+    if (signed === null) {
+      continue;
+    }
+
+    let inferred = false;
+    let flagNote = "";
+    if (!glCode) {
+      const guessed = inferExpenseGl(merchant, card, signed, priors);
+      if (guessed) {
+        glCode = guessed;
+        inferred = true;
+        flagNote = "FLAGGED: Blank GL — inferred from prior charges";
+      } else {
+        glCode = "";
+        flagNote = "FLAGGED: Blank Accounting Category Code";
+      }
+    }
+
+    const propertyAbbr = derivePropertyAbbreviation(location);
+    if (!propertyAbbr) {
+      skippedNonTransactionCount++;
+      continue;
+    }
+
+    const locCfg = resolveLocationConfig(location);
+    if (!locCfg?.ccGl) {
+      skippedNonTransactionCount++;
+      continue;
+    }
+
+    const amount = formatMoneyAmount(Math.abs(signed));
+    const isRefund = signed < 0;
+
+    propertyCodes.add(propertyAbbr);
+    if (locCfg.fileCode) fileCodes.add(locCfg.fileCode);
+    if (parsedDate) dates.push(parsedDate);
+
+    if (flagNote) {
+      flaggedRows.push({
+        Date: outputDate,
+        Amount: amountRaw,
+        "Merchant Description": merchant,
+        "Ramp Location": location,
+        "External ID": externalId,
+        Issue: flagNote.replace(/^FLAGGED:\s*/, ""),
+      });
+    }
+
+    // Track positive coded charges for later blank-GL / refund inference
+    if (!isRefund && !inferred && glCode) {
+      priors.push({
+        merchant,
+        card,
+        amount: Math.abs(signed),
+        remaining: Math.abs(signed),
+        gl: glCode,
+        memo,
+        category,
+      });
+    }
+
+    // LINE 1 — Expense (Debit for charges, Credit for refunds)
+    importRows.push({
+      "Property Abbreviation": propertyAbbr,
+      Date: outputDate,
+      "GL Account Number": glCode,
+      Description: merchant,
+      Debit: isRefund ? "" : amount,
+      Credit: isRefund ? amount : "",
+      "Accounting Basis": "Both",
+      "Line-Item Description": merchant,
+      "Reversal Date": "",
+      Reference: flagNote,
+    });
+
+    // LINE 2 — CC Payable (Credit for charges, Debit for refunds)
+    importRows.push({
+      "Property Abbreviation": propertyAbbr,
+      Date: outputDate,
+      "GL Account Number": locCfg.ccGl,
+      Description: merchant,
+      Debit: isRefund ? amount : "",
+      Credit: isRefund ? "" : amount,
+      "Accounting Basis": "Both",
+      "Line-Item Description": merchant,
+      "Reversal Date": "",
+      Reference: flagNote,
+    });
+  }
+
+  let totalDebit = 0;
+  let totalCredit = 0;
+  for (const r of importRows) {
+    if (r.Debit) totalDebit += Number(r.Debit);
+    if (r.Credit) totalCredit += Number(r.Credit);
+  }
+  totalDebit = round2(totalDebit);
+  totalCredit = round2(totalCredit);
+
+  const propertyCode =
+    fileCodes.size === 1
+      ? [...fileCodes][0]
+      : propertyCodes.size === 1
+        ? [...propertyCodes][0]
+        : propertyCodes.size === 0
+          ? "UNK"
+          : "MULTI";
+
+  const periodYYYYMM = derivePeriodYYYYMM(headerMemo, dates);
+  const importFileName = `Ramp_CC_Import_${propertyCode}_${periodYYYYMM}.csv`;
+
+  return {
+    importCsv: toCsv([...IMPORT_HEADERS], importRows),
+    importRows,
+    flaggedRows,
+    summary: {
+      transactionCount: importRows.length / 2,
+      importLineCount: importRows.length,
+      flaggedCount: flaggedRows.length,
+      totalDebit,
+      totalCredit,
+      balanced: totalDebit === totalCredit,
+      propertyCode,
+      periodYYYYMM,
+      importFileName,
+      skippedNonTransactionCount,
+      properties: [...propertyCodes].sort(),
+    },
+  };
+}
+
+function parseSignedAmount(raw: string): number | null {
+  const cleaned = raw.replace(/[$,\s]/g, "");
+  if (!cleaned) return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Whole dollars without decimals; trim trailing zeros (303.10 → 303.1). */
+function formatMoneyAmount(abs: number): string {
+  const rounded = round2(abs);
+  if (Number.isInteger(rounded)) return String(Math.trunc(rounded));
+  return rounded
+    .toFixed(2)
+    .replace(/(\.\d*?)0+$/, "$1")
+    .replace(/\.$/, "");
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function parseFlexibleDate(value: string): Date | null {
+  if (!value) return null;
+  const mdy4 = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (mdy4) {
+    return new Date(Number(mdy4[3]), Number(mdy4[1]) - 1, Number(mdy4[2]));
+  }
+  const mdy2 = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (mdy2) {
+    const yy = Number(mdy2[3]);
+    const year = yy >= 70 ? 1900 + yy : 2000 + yy;
+    return new Date(year, Number(mdy2[1]) - 1, Number(mdy2[2]));
+  }
+  const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+  }
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatOutputDate(d: Date | null): string {
+  if (!d) return "";
+  return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+}
+
+function derivePeriodYYYYMM(headerMemo: string, dates: Date[]): string {
+  const fromMemo = headerMemo.match(/Ramp_Statement_(\d{4})(\d{2})\d{2}/i);
+  if (fromMemo) return `${fromMemo[1]}${fromMemo[2]}`;
+
+  if (dates.length === 0) {
+    const now = new Date();
+    return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  const counts = new Map<string, number>();
+  for (const d of dates) {
+    const key = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  let best = "";
+  let bestCount = -1;
+  for (const [key, count] of counts) {
+    if (count > bestCount || (count === bestCount && key > best)) {
+      best = key;
+      bestCount = count;
+    }
+  }
+  return best;
+}

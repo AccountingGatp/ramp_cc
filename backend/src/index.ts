@@ -1,4 +1,3 @@
-import cors from "cors";
 import express from "express";
 import multer from "multer";
 
@@ -7,11 +6,6 @@ import { processRampStatement } from "./rampImport.js";
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
-  }),
-);
 app.use(express.json());
 
 /** Keep the CSV in memory only — never write to disk */

@@ -25,7 +25,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://ramp-cc-backend.vercel.app";
 
 type ProcessSummary = {
   transactionCount: number;

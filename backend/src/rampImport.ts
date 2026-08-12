@@ -1,7 +1,5 @@
-import fs from "fs";
-import path from "path";
-
 import { getField, parseCsv, toCsv } from "./csv.js";
+import { LOCATION_CONFIG, type LocationConfig } from "./locationConfig.js";
 
 export const IMPORT_HEADERS = [
   "Property Abbreviation",
@@ -49,7 +47,6 @@ export type ProcessResult = {
   summary: ProcessSummary;
 };
 
-type LocationConfig = { ccGl: string; fileCode?: string };
 type PriorCharge = {
   merchant: string;
   card: string;
@@ -61,34 +58,7 @@ type PriorCharge = {
 };
 
 function loadLocationConfig(): Record<string, LocationConfig> {
-  const here = path.resolve(process.cwd());
-  const candidates = [
-    path.join(here, "cc-payable-gl.json"),
-    path.join(here, "..", "cc-payable-gl.json"),
-    path.join(here, "backend", "cc-payable-gl.json"),
-  ];
-
-  for (const file of candidates) {
-    if (!fs.existsSync(file)) continue;
-    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<
-      string,
-      string | LocationConfig
-    >;
-    const out: Record<string, LocationConfig> = {};
-    for (const [k, v] of Object.entries(raw)) {
-      const key = normalizeLocationKey(k);
-      if (typeof v === "string") {
-        out[key] = { ccGl: v.trim() };
-      } else {
-        out[key] = {
-          ccGl: String(v.ccGl ?? "").trim(),
-          fileCode: v.fileCode?.trim(),
-        };
-      }
-    }
-    return out;
-  }
-  return {};
+  return LOCATION_CONFIG;
 }
 
 function normalizeLocationKey(location: string): string {

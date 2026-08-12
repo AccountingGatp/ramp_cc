@@ -45,6 +45,7 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
     return;
   }
 
+  // Buffer only — never persisted to disk
   const { originalname, mimetype, size, buffer } = req.file;
 
   try {
@@ -89,6 +90,11 @@ app.use(
   },
 );
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend listening on http://0.0.0.0:${PORT}`);
-});
+// Local / traditional Node host only — Vercel uses the exported app
+if (!process.env.VERCEL) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Backend listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+export default app;

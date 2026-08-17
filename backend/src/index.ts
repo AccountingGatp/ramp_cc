@@ -1,6 +1,7 @@
 import express from "express";
 import multer from "multer";
 
+import { buildImportXlsx } from "./importWorkbook.js";
 import { processRampStatement } from "./rampImport.js";
 
 const app = express();
@@ -45,7 +46,7 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-app.post("/api/upload", upload.single("file"), (req, res) => {
+app.post("/api/upload", upload.single("file"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "No CSV file uploaded" });
     return;
@@ -57,11 +58,12 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
   try {
     const text = buffer.toString("utf-8");
     const processed = processRampStatement(text);
+    const xlsxBuffer = await buildImportXlsx(processed.importRows);
 
     res.json({
       message: processed.summary.balanced
         ? processed.summary.flaggedCount > 0
-          ? `Import sheet generated (balanced) — ${processed.summary.flaggedCount} flagged row(s) marked in Reference`
+          ? `Import sheet generated (balanced) — ${processed.summary.flaggedCount} blank GL(s) left empty and marked red`
           : "Import sheet generated — Total Debit = Total Credit (balanced)"
         : "Import sheet generated — WARNING: Debit and Credit totals do not match",
       file: {
@@ -72,6 +74,7 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
       },
       summary: processed.summary,
       importCsv: processed.importCsv,
+      importXlsxBase64: xlsxBuffer.toString("base64"),
     });
   } catch (err) {
     res.status(400).json({

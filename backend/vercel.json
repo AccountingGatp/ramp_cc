@@ -3,7 +3,7 @@
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "functions": {
     "api/index.ts": {
-      "includeFiles": "data/Ramp_Card_Vendor_GL.xlsx"
+      "includeFiles": "data/Ramp_Card_Vendor_GL.json"
     }
   }
 }

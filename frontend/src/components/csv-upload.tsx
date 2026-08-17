@@ -36,7 +36,8 @@ type ProcessSummary = {
   balanced: boolean;
   propertyCode: string;
   periodYYYYMM: string;
-  importFileName: string;
+  importCsvFileName: string;
+  importXlsxFileName: string;
   skippedNonTransactionCount: number;
   properties: string[];
 };
@@ -51,6 +52,7 @@ type UploadResult = {
   };
   summary: ProcessSummary;
   importCsv: string;
+  importXlsxBase64: string;
 };
 
 function formatBytes(bytes: number) {
@@ -68,6 +70,21 @@ function formatMoney(n: number) {
 
 function downloadCsv(filename: string, content: string) {
   const blob = new Blob([content], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadXlsx(filename: string, base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const blob = new Blob([bytes], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -318,23 +335,41 @@ export function CsvUpload() {
                       {result.summary.flaggedCount === 1 ? "" : "s"} included
                     </AlertTitle>
                     <AlertDescription>
-                      Marked in the Reference column. Review those lines before
-                      importing to ResMan.
+                      Download CSV for ResMan import, or XLSX to review blank GL
+                      cells (highlighted red). Single-GL vendors are filled from
+                      Ramp_Card_Vendor_GL.json.
                     </AlertDescription>
                   </Alert>
                 </>
               )}
             </CardContent>
-            <CardFooter>
+            <CardFooter className="flex flex-col gap-2 sm:flex-row">
               <Button
                 type="button"
-                className="w-full"
+                className="w-full sm:flex-1"
+                variant="outline"
                 onClick={() =>
-                  downloadCsv(result.summary.importFileName, result.importCsv)
+                  downloadCsv(
+                    result.summary.importCsvFileName,
+                    result.importCsv,
+                  )
                 }
               >
                 <Download />
-                <span className="truncate">{result.summary.importFileName}</span>
+                <span className="truncate">{result.summary.importCsvFileName}</span>
+              </Button>
+              <Button
+                type="button"
+                className="w-full sm:flex-1"
+                onClick={() =>
+                  downloadXlsx(
+                    result.summary.importXlsxFileName,
+                    result.importXlsxBase64,
+                  )
+                }
+              >
+                <Download />
+                <span className="truncate">{result.summary.importXlsxFileName}</span>
               </Button>
             </CardFooter>
           </Card>

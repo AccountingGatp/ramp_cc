@@ -8,20 +8,29 @@ export type VendorGlLookup =
   | { status: "multi"; gls: string[] }
   | { status: "none" };
 
+type VendorGlRow = {
+  Vendor?: string;
+  "GL Account"?: string;
+};
+
 let cachedMap: Map<string, string[]> | null = null;
 
 function normalizeVendorKey(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function extractGlCode(glAccount: string): string {
+export function extractGlCode(glAccount: string): string {
   const match = glAccount.trim().match(/^(\d+(?:-\d+)?)/);
   return match ? match[1] : "";
 }
 
-function vendorSheetCandidates(): string[] {
+function vendorDataCandidates(): string[] {
   const cwd = process.cwd();
   return [
+    path.join(cwd, "data", "Ramp_Card_Vendor_GL.json"),
+    path.join(cwd, "Ramp_Card_Vendor_GL.json"),
+    path.join(cwd, "..", "Ramp_Card_Vendor_GL.json"),
+    path.join(cwd, "backend", "data", "Ramp_Card_Vendor_GL.json"),
     path.join(cwd, "data", "Ramp_Card_Vendor_GL.xlsx"),
     path.join(cwd, "Ramp_Card_Vendor_GL.xlsx"),
     path.join(cwd, "..", "Ramp_Card_Vendor_GL.xlsx"),
@@ -29,23 +38,29 @@ function vendorSheetCandidates(): string[] {
   ];
 }
 
-/** Build vendor → unique GL codes from Ramp_Card_Vendor_GL.xlsx */
+function loadRowsFromFile(file: string): VendorGlRow[] {
+  if (file.toLowerCase().endsWith(".json")) {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as unknown;
+    return Array.isArray(parsed) ? (parsed as VendorGlRow[]) : [];
+  }
+
+  const workbook = XLSX.readFile(file);
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json<VendorGlRow>(sheet, { defval: "" });
+}
+
+/** Build vendor → unique GL codes from Ramp_Card_Vendor_GL.json (xlsx fallback). */
 export function loadVendorGlMap(): Map<string, string[]> {
   if (cachedMap) return cachedMap;
 
   const map = new Map<string, string[]>();
-  const file = vendorSheetCandidates().find((p) => fs.existsSync(p));
+  const file = vendorDataCandidates().find((p) => fs.existsSync(p));
   if (!file) {
     cachedMap = map;
     return map;
   }
 
-  const workbook = XLSX.readFile(file);
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
-    defval: "",
-  });
-
+  const rows = loadRowsFromFile(file);
   for (const row of rows) {
     const vendor = String(row.Vendor ?? "").trim();
     const gl = extractGlCode(String(row["GL Account"] ?? ""));
@@ -62,9 +77,9 @@ export function loadVendorGlMap(): Map<string, string[]> {
 }
 
 /**
- * Resolve GL for a flagged (blank code) merchant from the vendor sheet.
+ * Resolve GL for a blank Accounting Category Code from vendor JSON.
  * - exactly one GL for that vendor → use it
- * - multiple GLs → keep flagged (multi)
+ * - multiple GLs → keep blank (multi)
  * - not found → none
  */
 export function lookupVendorGl(
@@ -78,14 +93,16 @@ export function lookupVendorGl(
     .map(normalizeVendorKey)
     .filter(Boolean);
 
-  // 1) Exact vendor match
+  const resultFromHits = (hits: string[]): VendorGlLookup => {
+    if (hits.length === 1) return { status: "single", gl: hits[0] };
+    if (hits.length > 1) return { status: "multi", gls: hits };
+    return { status: "none" };
+  };
+
+  // 1) Exact vendor match — most specific, do not mix with shorter names like "Cash Flow"
   for (const q of queries) {
     const hit = map.get(q);
-    if (hit) {
-      return hit.length === 1
-        ? { status: "single", gl: hit[0] }
-        : { status: "multi", gls: hit };
-    }
+    if (hit) return resultFromHits(hit);
   }
 
   // 2) Token match (e.g. FACEBK *4E5KTUVTH2 → 4E5KTUVTH2)
@@ -96,34 +113,26 @@ export function lookupVendorGl(
       .filter((t) => t.length >= 6);
     for (const token of tokens) {
       const hit = map.get(token);
-      if (hit) {
-        return hit.length === 1
-          ? { status: "single", gl: hit[0] }
-          : { status: "multi", gls: hit };
-      }
+      if (hit) return resultFromHits(hit);
     }
   }
 
-  // 3) Sheet vendor contained in merchant / merchant contained in vendor
-  //    Only accept if the match yields a single unique GL across hits.
-  const collected = new Set<string>();
-  let matchedVendorKeys = 0;
+  // 3) Longest vendor-name match only (ignore shorter generic names)
+  let bestLen = 0;
+  const bestGls = new Set<string>();
   for (const q of queries) {
     for (const [vendor, gls] of map) {
-      if (vendor.length < 4) continue;
-      if (q.includes(vendor) || vendor.includes(q)) {
-        matchedVendorKeys++;
-        for (const gl of gls) collected.add(gl);
+      if (vendor.length < 8) continue;
+      if (!(q.includes(vendor) || vendor.includes(q))) continue;
+      if (vendor.length > bestLen) {
+        bestLen = vendor.length;
+        bestGls.clear();
+        for (const gl of gls) bestGls.add(gl);
+      } else if (vendor.length === bestLen) {
+        for (const gl of gls) bestGls.add(gl);
       }
     }
   }
 
-  if (collected.size === 1 && matchedVendorKeys > 0) {
-    return { status: "single", gl: [...collected][0] };
-  }
-  if (collected.size > 1) {
-    return { status: "multi", gls: [...collected] };
-  }
-
-  return { status: "none" };
+  return resultFromHits([...bestGls]);
 }

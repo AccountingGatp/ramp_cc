@@ -1,6 +1,6 @@
 import { getField, parseCsv, toCsv } from "./csv.js";
 import { LOCATION_CONFIG, type LocationConfig } from "./locationConfig.js";
-import { lookupVendorGl } from "./vendorGlLookup.js";
+import { lookupVendorGl, extractGlCode } from "./vendorGlLookup.js";
 
 export const IMPORT_HEADERS = [
   "Property Abbreviation",
@@ -36,7 +36,8 @@ export type ProcessSummary = {
   balanced: boolean;
   propertyCode: string;
   periodYYYYMM: string;
-  importFileName: string;
+  importCsvFileName: string;
+  importXlsxFileName: string;
   skippedNonTransactionCount: number;
   properties: string[];
 };
@@ -46,16 +47,6 @@ export type ProcessResult = {
   importRows: ImportRow[];
   flaggedRows: FlaggedRow[];
   summary: ProcessSummary;
-};
-
-type PriorCharge = {
-  merchant: string;
-  card: string;
-  amount: number;
-  remaining: number;
-  gl: string;
-  memo: string;
-  category: string;
 };
 
 function loadLocationConfig(): Record<string, LocationConfig> {
@@ -91,71 +82,8 @@ function resolveLocationConfig(location: string): LocationConfig | null {
   return null;
 }
 
-/**
- * Infer expense GL when Accounting Category Code is blank — from prior coded
- * charges for the same merchant (and card when possible). Matches how Claude
- * filled refunds like Home Depot −1277.75 → 1370 from the canceled charge.
- */
-function inferExpenseGl(
-  merchant: string,
-  card: string,
-  signedAmount: number,
-  priors: PriorCharge[],
-): string | null {
-  const absAmt = Math.abs(signedAmount);
-  const isRefund = signedAmount < 0;
-  const sameMerchant = [...priors]
-    .reverse()
-    .filter((p) => p.merchant === merchant);
-  const sameCard = sameMerchant.filter((p) => card && p.card === card);
-  const pool = sameCard.length > 0 ? sameCard : sameMerchant;
-
-  if (isRefund && pool.length > 0) {
-    const canceled = pool.find(
-      (p) => /cancel/i.test(p.memo) && p.remaining + 0.001 >= absAmt,
-    );
-    if (canceled) {
-      canceled.remaining = round2(canceled.remaining - absAmt);
-      return canceled.gl;
-    }
-
-    const exactRemaining = pool.find(
-      (p) => Math.abs(p.remaining - absAmt) < 0.015,
-    );
-    if (exactRemaining) {
-      exactRemaining.remaining = 0;
-      return exactRemaining.gl;
-    }
-
-    return pool[0].gl;
-  }
-
-  // Blank charge that looks HVAC/AC-related → reuse prior HVAC GL (e.g. Daikin 5445)
-  if (!isRefund && /(?:\bAC\b|A\/C|HVAC|FREON)/i.test(merchant)) {
-    const hvac = [...priors]
-      .reverse()
-      .find(
-        (p) =>
-          /hvac/i.test(p.category) || /DAIKIN|LINDE/i.test(p.merchant),
-      );
-    if (hvac) {
-      return hvac.gl;
-    }
-  }
-
-  if (sameMerchant.length > 0) return sameMerchant[0].gl;
-
-  const token = merchant.split(/\s+/)[0]?.replace(/[^A-Za-z]/g, "") ?? "";
-  if (token.length >= 4) {
-    const family = [...priors]
-      .reverse()
-      .find((p) =>
-        p.merchant.toUpperCase().startsWith(token.toUpperCase()),
-      );
-    if (family) return family.gl;
-  }
-
-  return null;
+function normalizeMerchantKey(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 export function processRampStatement(csvText: string): ProcessResult {
@@ -180,13 +108,29 @@ export function processRampStatement(csvText: string): ProcessResult {
     throw new Error("Ramp CSV must include Transaction Date or Clearing Date");
   }
 
+  // Same merchant in this file with exactly one GL → use it for blank rows
+  const merchantGlsInFile = new Map<string, Set<string>>();
+  for (const row of rows) {
+    if (getField(row, "Type").toLowerCase() !== "transaction") continue;
+    const merchant = normalizeMerchantKey(
+      getField(row, "Merchant Description", "Merchant Name"),
+    );
+    if (!merchant) continue;
+    const gl =
+      extractGlCode(getField(row, "Accounting Category Code")) ||
+      extractGlCode(getField(row, "Accounting Category"));
+    if (!gl) continue;
+    const set = merchantGlsInFile.get(merchant) ?? new Set<string>();
+    set.add(gl);
+    merchantGlsInFile.set(merchant, set);
+  }
+
   const importRows: ImportRow[] = [];
   const flaggedRows: FlaggedRow[] = [];
   let skippedNonTransactionCount = 0;
   const propertyCodes = new Set<string>();
   const fileCodes = new Set<string>();
   const dates: Date[] = [];
-  const priors: PriorCharge[] = [];
   let headerMemo = "";
 
   for (const row of rows) {
@@ -199,11 +143,10 @@ export function processRampStatement(csvText: string): ProcessResult {
     const merchant = getField(row, "Merchant Description", "Merchant Name");
     const merchantName = getField(row, "Merchant Name");
     const location = getField(row, "Ramp Location", "Location");
-    let glCode = getField(row, "Accounting Category Code");
+    let glCode =
+      extractGlCode(getField(row, "Accounting Category Code")) ||
+      extractGlCode(getField(row, "Accounting Category"));
     const externalId = getField(row, "External ID", "Transaction ID", "Id");
-    const card = getField(row, "Card Last 4");
-    const memo = getField(row, "Memo");
-    const category = getField(row, "Accounting Category");
     if (!headerMemo) headerMemo = getField(row, "Header Memo");
 
     if (type.toLowerCase() !== "transaction") {
@@ -219,22 +162,17 @@ export function processRampStatement(csvText: string): ProcessResult {
       continue;
     }
 
-    let inferred = false;
-    let fromVendorSheet = false;
     let flagNote = "";
+    // Missing GL in Ramp → blank + red, unless this file or vendor JSON has exactly one GL
     if (!glCode) {
-      const guessed = inferExpenseGl(merchant, card, signed, priors);
-      if (guessed) {
-        glCode = guessed;
-        inferred = true;
-        // Prior-charge inference is a guess — still mark for review
-        flagNote = "FLAGGED: Blank GL — inferred from prior charges";
+      const inFile = merchantGlsInFile.get(normalizeMerchantKey(merchant));
+      if (inFile && inFile.size === 1) {
+        glCode = [...inFile][0];
+        flagNote = "";
       } else {
         const vendorHit = lookupVendorGl(merchant, merchantName);
         if (vendorHit.status === "single") {
           glCode = vendorHit.gl;
-          fromVendorSheet = true;
-          // Single-GL vendor sheet match — treat as resolved (not flagged)
           flagNote = "";
         } else if (vendorHit.status === "multi") {
           glCode = "";
@@ -273,19 +211,6 @@ export function processRampStatement(csvText: string): ProcessResult {
         "Ramp Location": location,
         "External ID": externalId,
         Issue: flagNote.replace(/^FLAGGED:\s*/, ""),
-      });
-    }
-
-    // Track positive coded charges for later blank-GL / refund inference
-    if (!isRefund && !inferred && !fromVendorSheet && glCode) {
-      priors.push({
-        merchant,
-        card,
-        amount: Math.abs(signed),
-        remaining: Math.abs(signed),
-        gl: glCode,
-        memo,
-        category,
       });
     }
 
@@ -337,7 +262,7 @@ export function processRampStatement(csvText: string): ProcessResult {
           : "MULTI";
 
   const periodYYYYMM = derivePeriodYYYYMM(headerMemo, dates);
-  const importFileName = `Ramp_CC_Import_${propertyCode}_${periodYYYYMM}.csv`;
+  const importBaseName = `Ramp_CC_Import_${propertyCode}_${periodYYYYMM}`;
 
   return {
     importCsv: toCsv([...IMPORT_HEADERS], importRows),
@@ -352,7 +277,8 @@ export function processRampStatement(csvText: string): ProcessResult {
       balanced: totalDebit === totalCredit,
       propertyCode,
       periodYYYYMM,
-      importFileName,
+      importCsvFileName: `${importBaseName}.csv`,
+      importXlsxFileName: `${importBaseName}.xlsx`,
       skippedNonTransactionCount,
       properties: [...propertyCodes].sort(),
     },

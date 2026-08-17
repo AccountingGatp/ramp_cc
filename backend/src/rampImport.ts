@@ -82,10 +82,6 @@ function resolveLocationConfig(location: string): LocationConfig | null {
   return null;
 }
 
-function normalizeMerchantKey(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
 export function processRampStatement(csvText: string): ProcessResult {
   const { headers, rows } = parseCsv(csvText);
 
@@ -106,23 +102,6 @@ export function processRampStatement(csvText: string): ProcessResult {
   const hasClearingDate = lower.includes("clearing date");
   if (!hasTransactionDate && !hasClearingDate) {
     throw new Error("Ramp CSV must include Transaction Date or Clearing Date");
-  }
-
-  // Same merchant in this file with exactly one GL → use it for blank rows
-  const merchantGlsInFile = new Map<string, Set<string>>();
-  for (const row of rows) {
-    if (getField(row, "Type").toLowerCase() !== "transaction") continue;
-    const merchant = normalizeMerchantKey(
-      getField(row, "Merchant Description", "Merchant Name"),
-    );
-    if (!merchant) continue;
-    const gl =
-      extractGlCode(getField(row, "Accounting Category Code")) ||
-      extractGlCode(getField(row, "Accounting Category"));
-    if (!gl) continue;
-    const set = merchantGlsInFile.get(merchant) ?? new Set<string>();
-    set.add(gl);
-    merchantGlsInFile.set(merchant, set);
   }
 
   const importRows: ImportRow[] = [];
@@ -163,24 +142,18 @@ export function processRampStatement(csvText: string): ProcessResult {
     }
 
     let flagNote = "";
-    // Missing GL in Ramp → blank + red, unless this file or vendor JSON has exactly one GL
+    // Missing GL on this row → use vendor JSON only (do not copy from other rows)
     if (!glCode) {
-      const inFile = merchantGlsInFile.get(normalizeMerchantKey(merchant));
-      if (inFile && inFile.size === 1) {
-        glCode = [...inFile][0];
+      const vendorHit = lookupVendorGl(merchant, merchantName);
+      if (vendorHit.status === "single") {
+        glCode = vendorHit.gl;
         flagNote = "";
+      } else if (vendorHit.status === "multi") {
+        glCode = "";
+        flagNote = `FLAGGED: Vendor has multiple GLs (${vendorHit.gls.join(", ")})`;
       } else {
-        const vendorHit = lookupVendorGl(merchant, merchantName);
-        if (vendorHit.status === "single") {
-          glCode = vendorHit.gl;
-          flagNote = "";
-        } else if (vendorHit.status === "multi") {
-          glCode = "";
-          flagNote = `FLAGGED: Vendor has multiple GLs (${vendorHit.gls.join(", ")})`;
-        } else {
-          glCode = "";
-          flagNote = "FLAGGED: Blank Accounting Category Code";
-        }
+        glCode = "";
+        flagNote = "FLAGGED: Blank Accounting Category Code";
       }
     }
 

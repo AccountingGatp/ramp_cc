@@ -1,5 +1,6 @@
 import { getField, parseCsv, toCsv } from "./csv.js";
 import { LOCATION_CONFIG, type LocationConfig } from "./locationConfig.js";
+import { lookupVendorGl } from "./vendorGlLookup.js";
 
 export const IMPORT_HEADERS = [
   "Property Abbreviation",
@@ -196,6 +197,7 @@ export function processRampStatement(csvText: string): ProcessResult {
       : getField(row, "Clearing Date");
     const amountRaw = getField(row, "Amount");
     const merchant = getField(row, "Merchant Description", "Merchant Name");
+    const merchantName = getField(row, "Merchant Name");
     const location = getField(row, "Ramp Location", "Location");
     let glCode = getField(row, "Accounting Category Code");
     const externalId = getField(row, "External ID", "Transaction ID", "Id");
@@ -218,16 +220,29 @@ export function processRampStatement(csvText: string): ProcessResult {
     }
 
     let inferred = false;
+    let fromVendorSheet = false;
     let flagNote = "";
     if (!glCode) {
       const guessed = inferExpenseGl(merchant, card, signed, priors);
       if (guessed) {
         glCode = guessed;
         inferred = true;
+        // Prior-charge inference is a guess — still mark for review
         flagNote = "FLAGGED: Blank GL — inferred from prior charges";
       } else {
-        glCode = "";
-        flagNote = "FLAGGED: Blank Accounting Category Code";
+        const vendorHit = lookupVendorGl(merchant, merchantName);
+        if (vendorHit.status === "single") {
+          glCode = vendorHit.gl;
+          fromVendorSheet = true;
+          // Single-GL vendor sheet match — treat as resolved (not flagged)
+          flagNote = "";
+        } else if (vendorHit.status === "multi") {
+          glCode = "";
+          flagNote = `FLAGGED: Vendor has multiple GLs (${vendorHit.gls.join(", ")})`;
+        } else {
+          glCode = "";
+          flagNote = "FLAGGED: Blank Accounting Category Code";
+        }
       }
     }
 
@@ -262,7 +277,7 @@ export function processRampStatement(csvText: string): ProcessResult {
     }
 
     // Track positive coded charges for later blank-GL / refund inference
-    if (!isRefund && !inferred && glCode) {
+    if (!isRefund && !inferred && !fromVendorSheet && glCode) {
       priors.push({
         merchant,
         card,

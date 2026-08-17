@@ -16,7 +16,13 @@ type VendorGlRow = {
 let cachedMap: Map<string, string[]> | null = null;
 
 function normalizeVendorKey(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, " ");
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export function extractGlCode(glAccount: string): string {
@@ -77,8 +83,18 @@ export function loadVendorGlMap(): Map<string, string[]> {
 }
 
 /**
+ * Same merchant family (e.g. SAMS CLUB vs SAMS CLUB RENEWAL / Sam's Club).
+ * Prefix match so a more-specific JSON row cannot hide multiple family GLs.
+ */
+function isVendorFamily(query: string, vendor: string): boolean {
+  if (query === vendor) return true;
+  if (vendor.length < 8) return false;
+  return query.startsWith(`${vendor} `) || vendor.startsWith(`${query} `);
+}
+
+/**
  * Resolve GL for a blank Accounting Category Code from vendor JSON.
- * - exactly one GL for that vendor → use it
+ * - exactly one GL for that vendor family → use it
  * - multiple GLs → keep blank (multi)
  * - not found → none
  */
@@ -99,40 +115,24 @@ export function lookupVendorGl(
     return { status: "none" };
   };
 
-  // 1) Exact vendor match — most specific, do not mix with shorter names like "Cash Flow"
+  const familyGls = new Set<string>();
   for (const q of queries) {
-    const hit = map.get(q);
-    if (hit) return resultFromHits(hit);
+    for (const [vendor, gls] of map) {
+      if (isVendorFamily(q, vendor)) {
+        for (const gl of gls) familyGls.add(gl);
+      }
+    }
   }
+  if (familyGls.size > 0) return resultFromHits([...familyGls]);
 
-  // 2) Token match (e.g. FACEBK *4E5KTUVTH2 → 4E5KTUVTH2)
+  // Token match (e.g. FACEBK *4E5KTUVTH2 → 4E5KTUVTH2)
   for (const q of queries) {
-    const tokens = q
-      .split(/[^a-z0-9]+/i)
-      .map((t) => t.trim())
-      .filter((t) => t.length >= 6);
+    const tokens = q.split(" ").filter((t) => t.length >= 6);
     for (const token of tokens) {
       const hit = map.get(token);
       if (hit) return resultFromHits(hit);
     }
   }
 
-  // 3) Longest vendor-name match only (ignore shorter generic names)
-  let bestLen = 0;
-  const bestGls = new Set<string>();
-  for (const q of queries) {
-    for (const [vendor, gls] of map) {
-      if (vendor.length < 8) continue;
-      if (!(q.includes(vendor) || vendor.includes(q))) continue;
-      if (vendor.length > bestLen) {
-        bestLen = vendor.length;
-        bestGls.clear();
-        for (const gl of gls) bestGls.add(gl);
-      } else if (vendor.length === bestLen) {
-        for (const gl of gls) bestGls.add(gl);
-      }
-    }
-  }
-
-  return resultFromHits([...bestGls]);
+  return { status: "none" };
 }
